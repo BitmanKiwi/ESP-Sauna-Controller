@@ -11,5 +11,14 @@
 # Old dashboard script — replaced by www/sauna-page.js and no longer works with current ESPHome
 /www/sauna-dashboard.js
 
+# KiCad local state and backups
+*.kicad_prl
+.history/
+_autosave-*
+*.lck
+*-backups/
+*.kicad_pcb-bak
+fp-info-cache
+
 # Scratch files
 *.docx

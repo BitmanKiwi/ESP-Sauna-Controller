@@ -3,9 +3,14 @@
 ESPHome firmware for a DIY sauna controller on a **JC3248W535** touchscreen board (ESP32-S3).
 It switches the heater through an SSR, runs a timed session, controls the lights, and serves its own web page.
 
-Shamelessly built using Claude's assistance. 
-ESP touch screen via the included link on AliExpress, Also used KICad to build a breakout PCB.
-You will need 2x 4 pin JST 1.25 pigtails and 1x 8 pin JST 1.25 pigtail to access the boards IO.
+Shamelessly built with Claude's assistance.
+
+The touchscreen board is linked under [Parts](#parts) (AliExpress). I used KiCad to design a breakout PCB for it.
+To reach the board's IO you will need two 4-pin and one 8-pin JST 1.25 pigtails.
+
+> **Safety:** this controller switches a mains-powered heater. Mains wiring should be done by a licensed electrician.
+> Don't rely on the firmware alone to prevent overheating. Fit an independent hardware over-temperature cutoff
+> (a thermal fuse or limit thermostat) in the heater circuit, and test it.
 
 ## Features
 
@@ -26,6 +31,7 @@ You will need 2x 4 pin JST 1.25 pigtails and 1x 8 pin JST 1.25 pigtail to access
 | `www/sauna-page.js` | The custom web page, built into the firmware |
 | `secrets.example.yaml` | Template for `secrets.yaml` (copy and fill in) |
 | `docs/JC3248W535/` | Board specification, pin map, slot drawings, chip datasheets, user manual |
+| `PCB/` | KiCad project for the breakout/interface board |
 
 ## Pins (as wired)
 
@@ -34,7 +40,7 @@ You will need 2x 4 pin JST 1.25 pigtails and 1x 8 pin JST 1.25 pigtail to access
 | Heater SSR | 15 | Firmware-controlled only |
 | Lights SSR | 16 | |
 | Thermometer supply | 9 | |
-| Enable input | 17 | Silkscreened "IO18" on the interface PCB (labels swapped) |
+| Enable input | 17 | On a board built from an earlier version of the PCB, silkscreened "IO18" (see Breakout PCB) |
 | MAX31855 | 5 (DO), 6 (CS), 7 (CLK) | Separate SPI bus |
 
 ## Setup
@@ -99,9 +105,27 @@ Readings pass through a plausibility check (below −20 °C or above 160 °C raw
 
 ### Troubleshooting
 
-- **Page is blank or shows the stock list:** the browser may be caching it. Hard-refresh (Ctrl+F5) after a flash.
+- **Page is blank or shows the stock list:** the browser may be caching it. Hard-refresh (Ctrl+F5, or Cmd+Shift+R on a Mac) after a flash.
 - **Noisy or jumping temperature:** keep the thermocouple cable apart from other wiring, ground its screen at the controller end only, and use a clean 12 V supply for the lights.
 - **Heater won't turn on:** check the enable input, that the status isn't **Times Up**, and that the temperature is below the setpoint minus the deadband.
+
+## Board IO connectors
+
+From the vendor schematic ("Extended IO" sheet). Check the connector pitch and pin 1 against your own board before wiring.
+
+| Connector | Pins (1 to last) | Used here |
+|-----------|------------------|-----------|
+| F2 (8-pin) | IO5, IO6, IO7, IO15, IO16, IO46, IO9, IO14 | IO5, IO6, IO7 (MAX31855), IO15 (heater), IO16 (lights), IO9 (thermometer supply) |
+| P3 (4-pin) | GND, 3.3V, IO17, IO18 | IO17 (enable input) |
+| P4 (4-pin) | GND, 3.3V, IO17, IO18 | Same signals as P3 (the schematic labels this one as a different pitch from P3) |
+
+## Breakout PCB
+
+The `PCB/` folder holds the KiCad project (`Sauna Controller Interface.kicad_pro` and `.kicad_pcb`) for the interface (breakout) board that breaks out the controller's IO.
+
+If you want to have the board made, open the KiCad files and generate your own output files (Gerbers and drill files) from them, using your manufacturer's settings. No Gerber files are included, so the output always matches the design you open. Check the design against your own wiring before ordering. 
+
+**Silkscreen fix:** the first version of this board had the IO17 and IO18 silkscreen labels on the two output headers the wrong way round. That is corrected in the KiCad files here. The enable input is GPIO17, and on a board built from the earlier version it is printed "IO18". Wire by function and the connector table above, not by the silkscreen, if you have one of those boards.
 
 ## Parts
 
