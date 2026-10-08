@@ -3,7 +3,7 @@
 ESPHome firmware for a DIY sauna controller on a **JC3248W535** touchscreen board (ESP32-S3).
 It switches the heater through an SSR, runs a timed session, controls the lights, and serves its own web page.
 
-Sheamelessly built using Claude's assistance. 
+Shamelessly built using Claude's assistance. 
 ESP touch screen via the included link on AliExpress, Also used KICad to build a breakout PCB.
 You will need 2x 4 pin JST 1.25 pigtails and 1x 8 pin JST 1.25 pigtail to access the boards IO.
 
