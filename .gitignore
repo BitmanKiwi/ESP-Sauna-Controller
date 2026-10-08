@@ -1,0 +1,15 @@
+# Gitignore settings for ESPHome
+# This is an example and may include too much for your use-case.
+# You can modify this file to suit your needs.
+/.esphome/
+/secrets.yaml
+
+# Vendor package for the JC3248W535 board (demos, compiled libraries, flash tool, ~500 MB).
+# The useful datasheets are copied into docs/JC3248W535/ instead.
+/Sauna Actual/
+
+# Old dashboard script — replaced by www/sauna-page.js and no longer works with current ESPHome
+/www/sauna-dashboard.js
+
+# Scratch files
+*.docx

@@ -1,0 +1,486 @@
+substitutions:
+  run_time_minutes: "75"   # hard-coded session length — change here, not via the UI
+
+esphome:
+  name: sauna-controller
+  friendly_name: Sauna Controller Production
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+logger:
+  level: NONE   # serial logging off (USB serial activity was adding noise to the thermocouple readings)
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  platform: esphome
+  password: !secret ota_password
+
+# Browser dashboard — custom page (www/sauna-page.js) replaces the stock entity list.
+# js_url: "" stops ESPHome loading its stock UI from the internet; the page is fully
+# self-contained and works offline. Do NOT add `local: true` — that ignores js_include.
+# Add ?stock to the address to try the stock UI instead (needs internet on the phone).
+web_server:
+  version: 3
+  js_url: ""
+  js_include: "www/sauna-page.js"
+  auth:
+    username: admin
+    password: !secret web_password
+
+# Run-time session tracking: a fresh session starts automatically the moment
+# Heater Enabled (GPIO17) goes true. When it elapses, heating is blocked until
+# a manual reset (web button or touchscreen tap).
+globals:
+  - id: session_active
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: session_expired
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: session_start_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+# Onboard touch controller — dedicated I2C pins (GPIO4/GPIO8) with onboard pull-ups, no external wiring
+i2c:
+  sda: GPIO4
+  scl: GPIO8
+  frequency: 400kHz
+
+touchscreen:
+  platform: axs15231
+  id: sauna_touch
+  interrupt_pin: GPIO3
+  # Raw touch coords already match the display's native orientation
+  # (x ~11-309 left-to-right, y ~67-460 top-to-bottom), so no swap/mirror is needed.
+  # If buttons ever stop responding, re-run a 4-corner raw-coordinate test before changing this.
+  transform:
+    swap_xy: false
+    mirror_x: false
+    mirror_y: false
+  on_touch:
+    then:
+      - lambda: |-
+          int x = touch.x;
+          int y = touch.y;
+          // Minus button: bottom-left
+          if (x > 20 && x < 120 && y > 380 && y < 440) {
+            id(set_temp).make_call().set_value(id(set_temp).state - 1).perform();
+          }
+          // Plus button: bottom-right
+          if (x > 200 && x < 300 && y > 380 && y < 440) {
+            id(set_temp).make_call().set_value(id(set_temp).state + 1).perform();
+          }
+          // Light toggle — circle centred at (160,200), radius 30
+          if (x > 130 && x < 190 && y > 170 && y < 230) {
+            id(lights).toggle().perform();
+          }
+          // Time remaining — tap to reset the run timer (zone kept clear of the Heat LED)
+          if (x > 80 && x < 200 && y > 280 && y < 320) {
+            id(reset_timer).execute();
+          }
+          // Heat LED — tap to end the run early (circle centred at (250,300))
+          if (x > 230 && x < 270 && y > 280 && y < 320) {
+            id(end_timer).execute();
+          }
+
+text_sensor:
+  - platform: template
+    id: sauna_status
+    name: "Sauna Status"
+
+  - platform: template
+    id: enabled_status
+    name: "Heater Enabled"
+
+button:
+  - platform: template
+    name: "Reset Run Timer"
+    id: reset_run_timer
+    on_press:
+      then:
+        - script.execute: reset_timer
+
+  - platform: template
+    name: "End Run Timer"
+    id: end_run_timer
+    on_press:
+      then:
+        - script.execute: end_timer
+
+binary_sensor:
+  # GPIO17 — enable input from the relay monitoring the external smart switch in
+  # series with the element power. Relay contact is assumed to pull the pin to GND
+  # when enabled, so it's inverted: true = enabled. Flip `inverted` if that's backwards.
+  # NOTE: this is the pad silkscreened "IO18" on the interface PCB (IO17/IO18 labels are swapped).
+  - platform: gpio
+    pin:
+      number: GPIO17
+      mode: INPUT_PULLUP
+      inverted: true
+    id: heater_enabled
+    name: "Heater Enabled"
+    internal: true   # raw reading only — the "Heater Enabled" text_sensor (Ready/Not Ready/Times Up) is what's shown
+    on_state:
+      then:
+        - script.execute: update_heater
+
+  # Read-only mirror of the heater output's state — shows as an LED-style indicator on the
+  # web UI, since the heater switch itself is internal (firmware-controlled only)
+  - platform: template
+    id: heater_status
+    name: "Sauna Heater"
+
+switch:
+  # GPIO15 — heater, via SSR (pin swap test reverted)
+  - platform: gpio
+    pin: GPIO15
+    id: heater
+    name: "Sauna Heater"
+    internal: true   # hidden from the web UI — heater is firmware-controlled only, not manually switchable
+    restore_mode: ALWAYS_OFF
+
+  # GPIO9 — switched 12V supply to the internal DC thermometer, via opto DC-DC SSR
+  - platform: gpio
+    pin: GPIO9
+    id: thermometer_supply
+    name: "Internal Thermometer Supply"
+    restore_mode: ALWAYS_OFF
+
+# GPIO16 — lights, plain ON/OFF via opto DC-DC SSR (PWM dimming removed as a diagnostic:
+# full-on/full-off removes any SSR-vs-PWM question while tracking down "no output").
+# The thermometer supply (GPIO9) is a separate switch again — no longer linked to the lights.
+# To restore dimming: swap the output back to `platform: ledc` (frequency 250Hz)
+# and the light back to `platform: monochromatic`.
+output:
+  - platform: gpio
+    pin: GPIO16
+    id: lights_out
+
+light:
+  - platform: binary
+    id: lights
+    name: "Sauna Lights"
+    output: lights_out
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - component.update: sauna_display
+    on_turn_off:
+      - component.update: sauna_display
+
+number:
+  - platform: template
+    name: "Sauna Set Temperature"
+    id: set_temp
+    unit_of_measurement: "°C"
+    min_value: 0
+    max_value: 100
+    step: 1
+    initial_value: 75.0
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - script.execute: update_heater
+
+  # Hysteresis band below the setpoint. Heater switches OFF at the setpoint and
+  # back ON only once the temp has dropped more than this far below it.
+  # 0 = no deadband (switches right at the setpoint).
+  - platform: template
+    name: "Sauna Deadband"
+    id: deadband
+    unit_of_measurement: "°C"
+    min_value: 0
+    max_value: 10
+    step: 0.1
+    mode: box
+    initial_value: 1.0
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - script.execute: update_heater
+
+  - platform: template
+    name: "Sauna Calibration Offset"
+    id: calibration_offset
+    unit_of_measurement: "°C"
+    min_value: -40
+    max_value: 40
+    step: 0.1
+    mode: box   # text input box rather than a slider, for precise typed values
+    initial_value: 10.0
+    restore_value: true
+    optimistic: true
+
+  # Extra correction applied ONLY while the lights are on — the 12V lights circuit shifts the
+  # thermocouple reading slightly. Added to the reading while lights are on (use a negative
+  # value if the reading goes up with the lights on). 0 = no correction.
+  - platform: template
+    name: "Sauna Lights Offset"
+    id: lights_offset
+    unit_of_measurement: "°C"
+    min_value: -40
+    max_value: 40
+    step: 0.1
+    mode: box
+    initial_value: 3.8   # measured: reading drops 3.8C with the lights on
+    restore_value: true
+    optimistic: true
+
+# Onboard AXS15231B panel — quad SPI bus (vendor pincfg.h: TFT_SCK=47, TFT_SDA0-3=21/48/40/39, TFT_CS=45, TFT_BLK=1)
+spi:
+  - id: display_bus
+    type: quad
+    clk_pin: GPIO47
+    data_pins: [GPIO21, GPIO48, GPIO40, GPIO39]
+
+  # MAX31855 thermocouple — separate single SPI bus, wired via the interface PCB
+  # GPIO5 = DO (MISO), GPIO6 = CS (set on the sensor below), GPIO7 = CLK
+  - id: thermo_bus
+    clk_pin: GPIO7
+    miso_pin: GPIO5
+
+display:
+  - platform: qspi_dbi
+    id: sauna_display
+    spi_id: display_bus
+    model: AXS15231
+    cs_pin:
+      number: GPIO45
+      ignore_strapping_warning: true
+    enable_pin: GPIO1
+    dimensions:
+      width: 320
+      height: 480
+    data_rate: 20MHz          # kept at 20MHz — 40MHz coupled noise into the thermocouple SPI bus
+    color_order: rgb
+    update_interval: never    # redraws are triggered by update_heater (every temp reading, input change, etc.), not on a timer
+    lambda: |-
+      // Read temp / Set temp, big, at top
+      it.printf(160, 90, id(sauna_font), Color(255,255,255), TextAlign::CENTER, "%.1f / %.1f C", roundf(id(sauna_temp).state * 2.0f) / 2.0f, id(set_temp).state);   // temp shown to the nearest 0.5 — control still uses full precision
+
+      // Status text — currently always blank; Ready/Not Ready/Times Up (top
+      // corner) and the Heat LED cover everything this line used to show
+      it.printf(160, 150, id(button_font), Color(255,255,255), TextAlign::CENTER,
+                id(sauna_status).state.c_str());
+
+      // Light toggle button — a circle: filled yellow when on, white outline when off
+      if (id(lights).current_values.is_on()) {
+        it.filled_circle(160, 200, 30, Color(255,255,0));
+      } else {
+        it.circle(160, 200, 30, Color(255,255,255));
+      }
+
+      // Time remaining (tap to reset) — live countdown, redrawn on each 1s temp reading
+      {
+        char time_buf[16];
+        if (id(session_active)) {
+          uint32_t total_sec = ${run_time_minutes} * 60;
+          uint32_t elapsed_sec = (millis() - id(session_start_ms)) / 1000;
+          uint32_t remaining_sec = (elapsed_sec < total_sec) ? (total_sec - elapsed_sec) : 0;
+          snprintf(time_buf, sizeof(time_buf), "%u:%02u", remaining_sec / 60, remaining_sec % 60);
+        } else if (id(session_expired)) {
+          snprintf(time_buf, sizeof(time_buf), "0:00");
+        } else {
+          snprintf(time_buf, sizeof(time_buf), "--:--");
+        }
+        it.printf(140, 300, id(button_font), Color(255,255,255), TextAlign::CENTER, time_buf);
+      }
+
+      // Heat LED (tap to end the run) — right of the timer: filled red while heating, outline when idle
+      if (id(heater_status).state) {
+        it.filled_circle(250, 300, 12, Color(255,0,0));
+      } else {
+        it.circle(250, 300, 12, Color(255,255,255));
+      }
+
+      // Set-temperature row with plus/minus buttons
+      it.rectangle(20, 380, 100, 60, Color(255,255,255));
+      it.printf(70, 410, id(button_font), Color(255,255,255), TextAlign::CENTER, "-");
+      it.rectangle(200, 380, 100, 60, Color(255,255,255));
+      it.printf(250, 410, id(button_font), Color(255,255,255), TextAlign::CENTER, "+");
+
+      // Ready / Not Ready / Times Up — top-right
+      it.printf(295, 20, id(small_font), Color(255,255,255), TextAlign::TOP_RIGHT,
+                id(enabled_status).state.c_str());
+
+font:
+  - file: "gfonts://Roboto"
+    id: sauna_font
+    size: 36   # sized so "22.5 / 75.0 C" fits the 320px width
+  - file: "gfonts://Roboto"
+    id: button_font
+    size: 40
+  - file: "gfonts://Roboto"
+    id: small_font
+    size: 24
+
+sensor:
+  # Seconds left in the current run — published by update_heater, shown on the web page.
+  # NaN (shown as "--:--") when no run is active.
+  - platform: template
+    id: time_remaining
+    name: "Run Time Remaining"
+    unit_of_measurement: "s"
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: max31855
+    id: sauna_temp
+    name: "Sauna Temperature"
+    spi_id: thermo_bus
+    cs_pin: GPIO6
+    data_rate: 200kHz   # slow clock (ESPHome default is 4MHz) — kinder to the extended thermocouple wiring; the MAX31855 only needs a few kHz
+    update_interval: 333ms   # ~3 readings per second (MAX31855 converts in ~100ms)
+    filters:
+      # Plausibility guard: readings outside this range (e.g. the -100C plunges seen when the
+      # lights are on) are thrown away before they reach the filters or the heater logic.
+      - lambda: |-
+          if (std::isnan(x) || x < -20.0f || x > 160.0f) return {};
+          return x;
+      # Lights-on correction, applied to the raw readings (before the median/average) so it lines
+      # up instantly with the shift the lights cause, with no lag-induced overshoot.
+      - lambda: |-
+          if (id(lights).current_values.is_on()) return x + id(lights_offset).state;
+          return x;
+      - median:
+          window_size: 15   # median of the last 15 readings (~5s) — throws out short bursts of bad readings before averaging
+          send_every: 1
+          send_first_at: 1
+      - sliding_window_moving_average:
+          window_size: 45   # average of the last 45 readings (~15s at 3 readings/s)
+          send_every: 3     # publish once per second — keeps heater logic + display redraws at 1Hz
+      - lambda: |-
+          return x + id(calibration_offset).state;   // calibration offset, adjustable from the web page
+      # Failsafe: if no valid reading gets through for 30s, publish "no reading" (NaN).
+      # update_heater treats NaN as heater OFF.
+      - timeout:
+          timeout: 30s
+          value: nan
+    on_value:
+      then:
+        - script.execute: update_heater
+
+# Single source of truth for heater control + run-time session tracking.
+# Called whenever: the measured temp updates, the set temp changes, the
+# Heater Enabled input changes, or a manual reset is triggered.
+#
+# Behaviour: heating only ever runs while Heater Enabled (GPIO17) is true.
+# The moment it goes true, a fresh ${run_time_minutes}-minute session starts
+# automatically (heating toward the stored setpoint). If it's still enabled
+# when the session elapses, heating stops until a manual reset (web button
+# or touchscreen tap) — that's the over-run guard. If Enabled goes false
+# (e.g. the smart relay is switched off), the session resets entirely so the
+# next activation always gets a full fresh run, not a resumed countdown.
+#
+# Switching uses a web-adjustable deadband (hysteresis): the heater turns OFF at
+# the setpoint and back ON once the temp falls below (setpoint - deadband).
+script:
+  - id: update_heater
+    then:
+      - lambda: |-
+          bool enabled = id(heater_enabled).state;
+          uint32_t now = millis();
+
+          if (!enabled) {
+            // Not enabled — nothing heats, and clear the session so the next
+            // activation starts a fresh full-length run
+            id(session_active) = false;
+            id(session_expired) = false;
+            id(session_start_ms) = 0;
+          } else {
+            // Enabled — auto-start a session if one isn't already running or expired
+            if (!id(session_active) && !id(session_expired)) {
+              id(session_active) = true;
+              id(session_start_ms) = now;
+            }
+            if (id(session_active)) {
+              uint32_t elapsed_min = (now - id(session_start_ms)) / 60000;
+              if (elapsed_min >= ${run_time_minutes}) {
+                id(session_expired) = true;
+                id(session_active) = false;
+              }
+            }
+          }
+
+          // Heat demand with hysteresis: ON below (setpoint - deadband), OFF at/above the
+          // setpoint, and inside the band keep whatever the heater is already doing.
+          // A missing/invalid temperature reading (sensor fault) always means heater OFF.
+          float temp = id(sauna_temp).state;
+          float setpoint = id(set_temp).state;
+          float band = id(deadband).state;
+          bool want_heat;
+          if (std::isnan(temp)) {
+            want_heat = false;
+          } else if (temp < setpoint - band) {
+            want_heat = true;
+          } else if (temp >= setpoint) {
+            want_heat = false;
+          } else {
+            want_heat = id(heater).state;
+          }
+
+          bool heating = enabled && !id(session_expired) && want_heat;
+
+          if (id(session_expired)) {
+            id(enabled_status).publish_state("Times Up");
+          } else {
+            id(enabled_status).publish_state(enabled ? "Ready" : "Not Ready");
+          }
+
+          // Countdown for the web page (seconds); NaN when no run is active
+          if (id(session_active)) {
+            uint32_t total_sec = ${run_time_minutes} * 60;
+            uint32_t elapsed_sec = (now - id(session_start_ms)) / 1000;
+            id(time_remaining).publish_state(elapsed_sec < total_sec ? (float)(total_sec - elapsed_sec) : 0.0f);
+          } else if (id(session_expired)) {
+            id(time_remaining).publish_state(0.0f);
+          } else {
+            id(time_remaining).publish_state(NAN);
+          }
+
+          id(sauna_status).publish_state("");   // Ready/Not Ready/Times Up (top) + the Heat LED already cover everything
+
+          if (heating) { id(heater).turn_on(); } else { id(heater).turn_off(); }
+          id(heater_status).publish_state(heating);
+      - component.update: sauna_display
+
+  # Manual reset (web button or touchscreen tap) — clears the session so a
+  # fresh run starts immediately if still enabled
+  - id: reset_timer
+    then:
+      - lambda: |-
+          id(session_active) = false;
+          id(session_expired) = false;
+          id(session_start_ms) = 0;
+      - script.execute: update_heater
+
+  # Manual end (web button or touchscreen Heat LED tap) — immediately ends
+  # the current session and stops heating, regardless of time remaining.
+  # Stays ended until a reset.
+  - id: end_timer
+    then:
+      - lambda: |-
+          id(session_active) = false;
+          id(session_expired) = true;
+      - script.execute: update_heater
